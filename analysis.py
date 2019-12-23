@@ -10,6 +10,8 @@ from sklearn.model_selection import train_test_split, cross_val_score
 from collections import OrderedDict
 from configparser import ConfigParser
 from sqlalchemy import create_engine
+import click
+import json
 
 cnx_dir = os.getenv("CONNECTION_INFO")
 parser = ConfigParser()
@@ -94,27 +96,100 @@ sql =("select w.geoid10, numpermit, numdemo, ninter/sqmiland inter_density,"
     "and w.geoid10 = p.geoid10;") 
 
 df = pd.read_sql(sql, engine)
-#scaling function
-#Net Construction PD
-df['scale_const'] = min_max_scale(df.numpermit)
-df['scale_demo'] = min_max_scale(df.numdemo)
-#permit column is actually net construction, but needs to be named permit
-#to run correctly in fact_heatmap function
-df['net'] = df.scale_const - df.scale_demo
-new_cols = df.columns.tolist()
-#strip wwl out of column names
-for i in range(len(new_cols)):
-    if new_cols[i][:3] == 'wwl':
-        new_cols[i] = new_cols[i][4:]
-df.columns = new_cols
-
-df.fillna(0, inplace=True)
 x_vars = [col for col in df.columns if col not in 
             ['numpermit', 'numdemo', 'geoid10', 'wkb_geometry', 
              'scale_const', 'scale_demo', 'net']]
-X = df[x_vars]
+#X = df[x_vars]
 y_net = df.net
 X_pos = df[df.net > 0][x_vars]
 y_pos = df[df.net > 0]['net']
 X_neg = df[df.net < 0][x_vars]
 y_neg = df[df.net < 0]['net']
+
+def corr_matrix(df):
+    from string import ascii_letters
+    import numpy as np
+    import pandas as pd
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+
+    X = df[x_vars]
+    sns.set(style="white")
+
+    # Compute the correlation matrix
+    corr = X.corr()
+
+    # Generate a mask for the upper triangle
+    mask = np.zeros_like(corr, dtype=np.bool)
+    mask[np.triu_indices_from(mask)] = True
+
+    # Set up the matplotlib figure
+    f, ax = plt.subplots(figsize=(11, 9))
+
+    # Generate a custom diverging colormap
+    cmap = sns.diverging_palette(220, 10, as_cmap=True)
+
+    # Draw the heatmap with the mask and correct aspect ratio
+    sns.heatmap(corr, mask=mask, cmap=cmap, center=0,
+                square=True, linewidths=.5, cbar_kws={"shrink": .5})    
+    ax.set_xticklables(corr.index, fontsize=6)
+    ax.set_yticklabels(corr.index, fontsize=6)
+    plt.savefig("./disorientation/figs/corr_matrix.png")
+
+def remove_correlates(X, coeff=.8):
+    """Identify which features have highest correlation coefficient. The method
+    returns a list of column names that should be excluded from an analysis,
+    but also updates a table in the project database
+
+    Args:
+        X (pandas dataframe): Pandas dataframe containing only predictor variables
+        coeff (float): threshold to identify values that should be removed
+
+    """
+
+    corr = X.corr()
+    #correlates = set()
+    correlates = list()
+    for col_idx in range(len(corr.columns)):
+        for row_idx in range(col_idx):
+            corr_coeff = corr.iloc[col_idx, row_idx]
+            if  abs(corr_coeff) > coeff:
+                d = {"var": corr.columns[col_idx],
+                     "corr_var": corr.index[row_idx],
+                     "corr_coeff": corr_coeff}
+                correlates.append(d)
+    df_corr = pd.read_json(json.dumps(correlates), orient="records")
+    df_corr.to_sql("correlation_values", con=engine, if_exists="replace", 
+        index=False)
+    return df_corr.var.tolist()
+
+
+
+def select_features(df):
+    from sklearn.feature_selection import RFE
+    from sklearn.ensemble import RandomForestRegressor 
+
+    #scaling function
+    #Net Construction PD
+    df['scale_const'] = min_max_scale(df.numpermit)
+    df['scale_demo'] = min_max_scale(df.numdemo)
+    #permit column is actually net construction, but needs to be named permit
+    #to run correctly in fact_heatmap function
+    df['net'] = df.scale_const - df.scale_demo
+    X = df[x_vars]
+    y = df.net
+    rf = RandomForestRegressor()
+    rfe = RFE(rf, n_features_to_select=1)
+    rfe.fit(X,y)
+
+
+@click.command()
+@click.option("--correlation", "-c", is_flag=True)
+def main(correlation):
+    df = pd.read_sql("select * from all_features")
+    df.fillna(0, inplace=True)
+    X = df[x_vars]
+    if correlation:
+        corr_matrix(df)
+
+if __name__=="__main__":
