@@ -22,11 +22,18 @@ engine = create_engine(psql_string.format(**psql_params))
 pd.set_option('display.width', 180)
 pd.set_option('display.float_format', lambda x: '%.3f' % x)
 pd.set_option('display.max_rows', 125)
+df = pd.read_sql("select * from all_features", engine)
+df.fillna(0, inplace=True)
 x_vars = [col for col in df.columns if col not in 
             ['numpermit', 'numdemo', 'geoid10', 'wkb_geometry', 
              'scale_const', 'scale_demo', 'net']]
 min_max_scale = lambda x: (x-x.min())/(x.max() - x.min())
 std_scale = lambda x: (x-x.mean())/float(x.std())
+df['scale_const'] = min_max_scale(df.numpermit)
+df['scale_demo'] = min_max_scale(df.numdemo)
+#permit column is actually net construction, but needs to be named permit
+#to run correctly in fact_heatmap function
+df['net'] = df.scale_const - df.scale_demo
 
 def add_missing(df):
     idx_cols = ["month", "year", "name"]
@@ -100,11 +107,11 @@ sql =("select w.geoid10, numpermit, numdemo, ninter/sqmiland inter_density,"
 
 #df = pd.read_sql(sql, engine)
 #X = df[x_vars]
-y_net = df.net
-X_pos = df[df.net > 0][x_vars]
-y_pos = df[df.net > 0]['net']
-X_neg = df[df.net < 0][x_vars]
-y_neg = df[df.net < 0]['net']
+#y_net = df.net
+#X_pos = df[df.net > 0][x_vars]
+#y_pos = df[df.net > 0]['net']
+#X_neg = df[df.net < 0][x_vars]
+#y_neg = df[df.net < 0]['net']
 
 def corr_matrix(df):
     """Create correlation matrix and generate heatmap
@@ -289,7 +296,7 @@ def scatter_plot(df, y="net"):
         if y == "net":
             df[df.net < 0].plot.scatter(x=cols[var_pos], y=y, marker="<",
                 ax=axes[row,col],color="Purple")
-            df[df.net >= 0].plot.scatter(x=cols[col], y=y, marker=">",
+            df[df.net >= 0].plot.scatter(x=cols[var_pos], y=y, marker=">",
                 ax=axes[row,col], color="Green")       
         else:
             color = lambda x: "Green" if "const" in x else "Purple"
@@ -307,18 +314,12 @@ def scatter_plot(df, y="net"):
 @click.command()
 @click.option("--correlation", "-c", is_flag=True)
 def main(correlation):
-    df = pd.read_sql("select * from all_features", engine)
-    df.fillna(0, inplace=True)
     X = df[x_vars]
     #scaling function
     #Net Construction PD
-    df['scale_const'] = min_max_scale(df.numpermit)
-    df['scale_demo'] = min_max_scale(df.numdemo)
-    #permit column is actually net construction, but needs to be named permit
-    #to run correctly in fact_heatmap function
-    df['net'] = df.scale_const - df.scale_demo
     y = df.net
     if correlation:
         corr_matrix(df)
 
 if __name__=="__main__":
+    main()
