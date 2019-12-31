@@ -22,6 +22,11 @@ engine = create_engine(psql_string.format(**psql_params))
 pd.set_option('display.width', 180)
 pd.set_option('display.float_format', lambda x: '%.3f' % x)
 pd.set_option('display.max_rows', 125)
+x_vars = [col for col in df.columns if col not in 
+            ['numpermit', 'numdemo', 'geoid10', 'wkb_geometry', 
+             'scale_const', 'scale_demo', 'net']]
+min_max_scale = lambda x: (x-x.min())/(x.max() - x.min())
+std_scale = lambda x: (x-x.mean())/float(x.std())
 
 def add_missing(df):
     idx_cols = ["month", "year", "name"]
@@ -34,8 +39,6 @@ def add_missing(df):
     df.permit.fillna(0, inplace=True)
     return df
 
-min_max_scale = lambda x: (x-x.min())/(x.max() - x.min())
-std_scale = lambda x: (x-x.mean())/float(x.std())
 #-----------------------------------------------------------------------------
 #--------------------------- Urban Index -------------------------------------
 #-----------------------------------------------------------------------------
@@ -95,10 +98,7 @@ sql =("select w.geoid10, numpermit, numdemo, ninter/sqmiland inter_density,"
     "where w.geoid10 = bg.geoid10 "
     "and w.geoid10 = p.geoid10;") 
 
-df = pd.read_sql(sql, engine)
-x_vars = [col for col in df.columns if col not in 
-            ['numpermit', 'numdemo', 'geoid10', 'wkb_geometry', 
-             'scale_const', 'scale_demo', 'net']]
+#df = pd.read_sql(sql, engine)
 #X = df[x_vars]
 y_net = df.net
 X_pos = df[df.net > 0][x_vars]
@@ -107,6 +107,11 @@ X_neg = df[df.net < 0][x_vars]
 y_neg = df[df.net < 0]['net']
 
 def corr_matrix(df):
+    """Create correlation matrix and generate heatmap
+
+    df (pandas dataframe): Pandas dataframe containing all of the features
+        to be used for matrix
+    """
     from string import ascii_letters
     import numpy as np
     import pandas as pd
@@ -154,21 +159,157 @@ def remove_correlates(X, coeff=.8):
         for row_idx in range(col_idx):
             corr_coeff = corr.iloc[col_idx, row_idx]
             if  abs(corr_coeff) > coeff:
-                d = {"var": corr.columns[col_idx],
-                     "corr_var": corr.index[row_idx],
+                d = {"variable": corr.columns[col_idx],
+                     "corr_variable": corr.index[row_idx],
                      "corr_coeff": corr_coeff}
                 correlates.append(d)
     df_corr = pd.read_json(json.dumps(correlates), orient="records")
     df_corr.to_sql("correlation_values", con=engine, if_exists="replace", 
         index=False)
-    return df_corr.var.tolist()
+    return df_corr.variable.to_list()
+
+def correlated_feature_list(df):
+    try:
+        df_corr = pd.read_sql("select * from correlation_values", engine)
+        return df_corr.variable.to_list()
+    except:
+        corr_feats = remove_correlates(df)
+        return corr_feats
 
 
+def select_features(df, yname="net", n_features=1):
+    """Select most important features using recursive feature elimination (RFE)
+        in conjunction with random forest regression and then plot the accuracy
+        of the fit.
 
-def select_features(df):
-    from sklearn.feature_selection import RFE
+    References:
+
+        Title: Feature Ranking RFE, Random Forest, Linear Models
+        Author: Arthur Tok
+        Date: June 18, 2018
+        Code version: 80
+        Availability: https://bit.ly/37ngDg8
+
+        Title: Selecting good features – Part IV: stability selection, RFE and everything side by side
+        Author: Ando Saabas
+        Date: December 20, 2014
+        Availability: https://bit.ly/2SGCuLx
+
+
+    """
+    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.linear_model import LinearRegression, Ridge, Lasso
     from sklearn.ensemble import RandomForestRegressor 
+    from sklearn.feature_selection import RFE
 
+    corr_features = correlated_feature_list(df)
+    X = df[[col for col in x_vars if col not in corr_features]]
+    cols = X.columns
+    random_state = 1234
+    feature_rank = {}
+    y = df[yname]
+
+    def rank_features(ranks, names, order=1):
+        minmax = MinMaxScaler()
+        feature_rank = minmax.fit_transform(order*np.array([ranks]).T).T[0]
+        feature_rank = map(lambda x: round(x,2), feature_rank)
+        return dict(zip(names, feature_rank))
+
+    #********************* Recursive Feature Elimination ***********    
+    #RFE with Linear Regression
+    lr = LinearRegression(normalize=True)
+    lr.fit(X,y)
+    rfe = RFE(lr, n_features_to_select=n_features, verbose=3)
+    rfe.fit(X,y)
+    feature_rank["rfe-lr"] = rank_features(list(map(float, rfe.ranking_)), cols,
+                        order=-1)
+    
+    #RFE with Random Forest Regression
+    rfr = RandomForestRegressor(max_features="sqrt", random_state=random_state)
+    rfr.fit(X,y)
+    rfe = RFE(rfr, n_features_to_select=n_features, verbose=3)
+    rfe.fit(X,y)
+    feature_rank["rfe-rfr"] = rank_features(list(map(float, rfe.ranking_)), cols,
+                        order=-1)
+
+    #************************* Regression *****************************
+    #Linear Regression alone
+    lr = LinearRegression(normalize=True)
+    lr.fit(X,y)
+    feature_rank["lr"] = rank_features(np.abs(lr.coef_), cols)
+    #Ridge Regression
+    ridge = Ridge(alpha=7)
+    ridge.fit(X,y)
+    feature_rank["ridge"] = rank_features(np.abs(ridge.coef_), cols)
+
+    #Lasso
+    lasso = Lasso(alpha=.05)
+    lasso.fit(X,y)
+    feature_rank["lasso"] = rank_features(np.abs(lasso.coef_), cols)
+
+    #Random Forest Regression alone
+    rfr = RandomForestRegressor(max_features="sqrt", random_state=random_state)
+    rfr.fit(X,y)
+    feature_rank["rfr"] = rank_features(rfr.feature_importances_, cols)
+
+    r = {}
+    for col in cols:
+        r[col] = round(np.mean([feature_rank[method][col] 
+                    for method in feature_rank.keys()]),2)
+    methods = sorted(feature_rank.keys())
+    feature_rank["mean"] = r
+    df_feature_rank = pd.DataFrame.from_dict(feature_rank)
+    df_feature_rank.to_sql("feature_rank_{}".format(yname),engine,
+                            if_exists='replace')
+    sort_feat_rank = df_feature_rank.sort_values("mean", ascending=False)
+    sort_feat_rank["colnames"] = sort_feat_rank.index
+    #plot feature rankings
+    f = sns.catplot(x="mean", y="colnames", data=sort_feat_rank, kind="bar",
+                    palette="coolwarm", height=22)
+    f.set_yticklabels(sort_feat_rank.colnames,fontsize=10)
+    f.set_xlabels("Mean Feature Importance")
+    f.set_ylabels("Column Name")
+    f.fig.tight_layout(pad=6.)
+    f.fig.suptitle("Mean Feature Importance for {}".format(yname))
+    plt.savefig("./disorientation/figs/bar_feat_ranking_{}.png".format(yname))
+
+def scatter_plot(df, y="net"):
+    """Generates scatter plot matrix for all predictor variables against a y-value
+    such as net construction, total construction or toal demolition.
+    """
+    corr_cols = correlated_feature_list(df)
+    cols = sorted([col for col in x_vars if col not in corr_cols])
+    nrows, ncols = 10,10
+    f, axes = plt.subplots(nrows, ncols, sharex=False, sharey=True,
+                    tight_layout=True, figsize=(24,24))
+    var_pos = 0
+    def plot(var_pos, row, col):
+        #if y-value is for net construction, add two plots, one for net-poitive
+        #construction, the other for net negative
+        if y == "net":
+            df[df.net < 0].plot.scatter(x=cols[var_pos], y=y, marker="<",
+                ax=axes[row,col],color="Purple")
+            df[df.net >= 0].plot.scatter(x=cols[col], y=y, marker=">",
+                ax=axes[row,col], color="Green")       
+        else:
+            color = lambda x: "Green" if "const" in x else "Purple"
+            df.plot.scatter(x=cols[var_pos], y=y, marker=">",
+                ax=axes[row,col], color=color(y))
+    for row in range(nrows):
+        for col in range(ncols):
+            if var_pos < len(cols):
+                plot(var_pos, row, col)
+            var_pos += 1
+    plt.savefig("./disorientation/figs/scatter_plot_all_feats_{}.png".format(y))
+    plt.close()
+
+
+@click.command()
+@click.option("--correlation", "-c", is_flag=True)
+def main(correlation):
+    df = pd.read_sql("select * from all_features", engine)
+    df.fillna(0, inplace=True)
+    X = df[x_vars]
     #scaling function
     #Net Construction PD
     df['scale_const'] = min_max_scale(df.numpermit)
@@ -176,19 +317,7 @@ def select_features(df):
     #permit column is actually net construction, but needs to be named permit
     #to run correctly in fact_heatmap function
     df['net'] = df.scale_const - df.scale_demo
-    X = df[x_vars]
     y = df.net
-    rf = RandomForestRegressor()
-    rfe = RFE(rf, n_features_to_select=1)
-    rfe.fit(X,y)
-
-
-@click.command()
-@click.option("--correlation", "-c", is_flag=True)
-def main(correlation):
-    df = pd.read_sql("select * from all_features")
-    df.fillna(0, inplace=True)
-    X = df[x_vars]
     if correlation:
         corr_matrix(df)
 
