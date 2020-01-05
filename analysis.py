@@ -34,6 +34,7 @@ df['scale_demo'] = min_max_scale(df.numdemo)
 #permit column is actually net construction, but needs to be named permit
 #to run correctly in fact_heatmap function
 df['net'] = df.scale_const - df.scale_demo
+RANDOM_STATE = 1416
 
 def add_missing(df):
     idx_cols = ["month", "year", "name"]
@@ -184,7 +185,7 @@ def correlated_feature_list(df):
         return corr_feats
 
 
-def select_features(df, yname="net", n_features=1):
+def create_feature_scores(df, yname="net", n_features=1, create_plot=False):
     """Select most important features using recursive feature elimination (RFE)
         in conjunction with random forest regression and then plot the accuracy
         of the fit.
@@ -212,9 +213,9 @@ def select_features(df, yname="net", n_features=1):
     corr_features = correlated_feature_list(df)
     X = df[[col for col in x_vars if col not in corr_features]]
     cols = X.columns
-    random_state = 1234
     feature_rank = {}
     y = df[yname]
+    accuracy = []
 
     def rank_features(ranks, names, order=1):
         minmax = MinMaxScaler()
@@ -230,14 +231,17 @@ def select_features(df, yname="net", n_features=1):
     rfe.fit(X,y)
     feature_rank["rfe-lr"] = rank_features(list(map(float, rfe.ranking_)), cols,
                         order=-1)
+    accuracy.append(["rfe-lr", rfe.score(X,y)])    
+
     
     #RFE with Random Forest Regression
-    rfr = RandomForestRegressor(max_features="sqrt", random_state=random_state)
+    rfr = RandomForestRegressor(max_features="sqrt", random_state=RANDOM_STATE)
     rfr.fit(X,y)
     rfe = RFE(rfr, n_features_to_select=n_features, verbose=3)
     rfe.fit(X,y)
     feature_rank["rfe-rfr"] = rank_features(list(map(float, rfe.ranking_)), cols,
                         order=-1)
+    accuracy.append(["rfe-rfr", rfe.score(X,y)])
 
     #************************* Regression *****************************
     #Linear Regression alone
@@ -248,16 +252,19 @@ def select_features(df, yname="net", n_features=1):
     ridge = Ridge(alpha=7)
     ridge.fit(X,y)
     feature_rank["ridge"] = rank_features(np.abs(ridge.coef_), cols)
+    accuracy.append(["ridge", ridge.score(X,y)])
 
     #Lasso
     lasso = Lasso(alpha=.05)
     lasso.fit(X,y)
     feature_rank["lasso"] = rank_features(np.abs(lasso.coef_), cols)
+    accuracy.append(["lasso", lasso.score(X,y)])
 
     #Random Forest Regression alone
-    rfr = RandomForestRegressor(max_features="sqrt", random_state=random_state)
+    rfr = RandomForestRegressor(max_features="sqrt", random_state=RANDOM_STATE)
     rfr.fit(X,y)
     feature_rank["rfr"] = rank_features(rfr.feature_importances_, cols)
+    accuracy.append(["rfr", rfr.score(X,y)])
 
     r = {}
     for col in cols:
@@ -271,14 +278,38 @@ def select_features(df, yname="net", n_features=1):
     sort_feat_rank = df_feature_rank.sort_values("mean", ascending=False)
     sort_feat_rank["colnames"] = sort_feat_rank.index
     #plot feature rankings
-    f = sns.catplot(x="mean", y="colnames", data=sort_feat_rank, kind="bar",
-                    palette="coolwarm", height=22)
-    f.set_yticklabels(sort_feat_rank.colnames,fontsize=10)
-    f.set_xlabels("Mean Feature Importance")
-    f.set_ylabels("Column Name")
-    f.fig.tight_layout(pad=6.)
-    f.fig.suptitle("Mean Feature Importance for {}".format(yname))
-    plt.savefig("./disorientation/figs/bar_feat_ranking_{}.png".format(yname))
+    if create_plot:
+        f = sns.catplot(x="mean", y="colnames", data=sort_feat_rank, kind="bar",
+                        palette="coolwarm", height=22)
+        f.set_yticklabels(sort_feat_rank.colnames,fontsize=10)
+        f.set_xlabels("Mean Feature Importance")
+        f.set_ylabels("Column Name")
+        f.fig.tight_layout(pad=6.)
+        f.fig.suptitle("Mean Feature Importance for {}".format(yname))
+        plt.savefig("./disorientation/figs/bar_feat_ranking_{}.png".format(yname))
+    return accuracy
+
+def select_features(yname="net", index_only=False, min_score=.0):
+    """Select the feature rank table (feature_rank_<yname>) from postgres
+
+    Args:
+        yname (str): the suffix for which postgres table should be selected. 
+            Accepted values are net, scale_const, or scale_demo. Defaults to 'net'
+        index_only (bool): False if only the index column containing the column
+            names should be returned, True if all columns from the table should
+            be returned. Defaults to False
+        min_score (float): the minimum mean importance score that should be returned.
+            Defaults to .0 for all values.
+    
+    Returns:
+
+    """
+    cols = "index" if index_only else "*"
+    params = {"yname": yname, "cols": cols, "mean": min_score}
+    sql = "select {cols} from feature_rank_{yname} where mean >= {mean}"
+    df = pd.read_sql(sql.format(**params), engine)
+    return df
+
 
 def scatter_plot(df, y="net"):
     """Generates scatter plot matrix for all predictor variables against a y-value
@@ -309,6 +340,61 @@ def scatter_plot(df, y="net"):
             var_pos += 1
     plt.savefig("./disorientation/figs/scatter_plot_all_feats_{}.png".format(y))
     plt.close()
+
+def num_trees(df, create_plot=False,feat_score=.25, yname="net"):
+
+    features = select_features(index_only=True, min_score=feat_score, yname=yname)
+    #determinte number of trees in forest
+    ensemble_clfs = [
+        ("RFR, max_features='sqrt'|red|-",
+            RandomForestRegressor(warm_start=True, oob_score=True,
+                                max_features="sqrt",
+                                random_state=RANDOM_STATE
+                                )),
+        ("RFR, max_features='log2'|green|-",
+            RandomForestRegressor(warm_start=True, max_features='log2',
+                                oob_score=True,
+                                random_state=RANDOM_STATE
+                                )),
+        ("RFR, max_features=None|blue|-",
+            RandomForestRegressor(warm_start=True, max_features=None,
+                                oob_score=True,
+                                random_state=RANDOM_STATE
+                                ))]
+    error_rate = OrderedDict((label, []) for label, _ in ensemble_clfs)
+
+    min_estimators = 15
+    max_estimators = 500
+    X = df[features["index"]]
+    y_net = df[yname]
+    for label, clf in ensemble_clfs:
+        for i in range(min_estimators, max_estimators + 1):
+            clf.set_params(n_estimators=i)
+            clf.fit(X, y_net)
+            # Record the OOB error for each `n_estimators=i` setting.
+            oob_error = 1 - clf.oob_score_
+            error_rate[label].append((i, oob_error))
+
+    # Generate the "OOB error rate" vs. "n_estimators" plot.
+    for label, clf_err in error_rate.items():
+        xs, ys = zip(*clf_err)
+        label, color, linestyle = label.split('|')
+        plt.plot(xs, ys, label=label, color=color,
+                linestyle=linestyle)
+
+    if create_plot:
+        plt.xlim(min_estimators, max_estimators)
+        plt.xlabel("n_estimators")
+        plt.ylabel("OOB error rate")
+        #plt.legend(bbox_to_anchor=(0, 1.1, 1., .102), loc="upper center", ncol=2)
+        plt.legend(ncol=2)
+        title = ("Estimator at Feature Mean of {0} with {1} Features\n"
+                 "for Column '{2}'")
+        plt.title(title.format(feat_score, features.shape[0], yname), pad=10)
+        plt.tight_layout()
+        min_score_format = int(feat_score*100)
+        plt.savefig("./disorientation/figs/rfr_accuracy_{0}_{1}.png".format(yname,min_score_format))
+        plt.close()
 
 
 @click.command()
