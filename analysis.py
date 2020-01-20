@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import sys
 import pandas as pd
 import os
@@ -12,6 +13,9 @@ from configparser import ConfigParser
 from sqlalchemy import create_engine
 import click
 import json
+import itertools
+import plotly as ply
+import plotly.express as px
 
 cnx_dir = os.getenv("CONNECTION_INFO")
 parser = ConfigParser()
@@ -22,6 +26,8 @@ engine = create_engine(psql_string.format(**psql_params))
 pd.set_option('display.width', 180)
 pd.set_option('display.float_format', lambda x: '%.3f' % x)
 pd.set_option('display.max_rows', 125)
+
+
 df = pd.read_sql("select * from all_features", engine)
 df.fillna(0, inplace=True)
 x_vars = [col for col in df.columns if col not in 
@@ -35,6 +41,10 @@ df['scale_demo'] = min_max_scale(df.numdemo)
 #to run correctly in fact_heatmap function
 df['net'] = df.scale_const - df.scale_demo
 RANDOM_STATE = 1416
+
+fig = px.parallel_coordinates(df[x_vars+["net"]], color="net", labels=x_vars+["net"], 
+color_continuous_scale=px.colors.diverging.Tealrose, color_continuous_midpoint=0)
+ply.offline.plot(fig)
 
 def add_missing(df):
     idx_cols = ["month", "year", "name"]
@@ -106,19 +116,14 @@ sql =("select w.geoid10, numpermit, numdemo, ninter/sqmiland inter_density,"
     "where w.geoid10 = bg.geoid10 "
     "and w.geoid10 = p.geoid10;") 
 
-#df = pd.read_sql(sql, engine)
-#X = df[x_vars]
-#y_net = df.net
-#X_pos = df[df.net > 0][x_vars]
-#y_pos = df[df.net > 0]['net']
-#X_neg = df[df.net < 0][x_vars]
-#y_neg = df[df.net < 0]['net']
+@click.group()
+def main():
+    pass
 
-def corr_matrix(df):
+@main.command()
+def corr_matrix():
     """Create correlation matrix and generate heatmap
 
-    df (pandas dataframe): Pandas dataframe containing all of the features
-        to be used for matrix
     """
     from string import ascii_letters
     import numpy as np
@@ -137,30 +142,34 @@ def corr_matrix(df):
     mask[np.triu_indices_from(mask)] = True
 
     # Set up the matplotlib figure
-    f, ax = plt.subplots(figsize=(11, 9))
+    f, ax = plt.subplots(figsize=(22, 18))
 
     # Generate a custom diverging colormap
     cmap = sns.diverging_palette(220, 10, as_cmap=True)
 
     # Draw the heatmap with the mask and correct aspect ratio
     sns.heatmap(corr, mask=mask, cmap=cmap, center=0,
-                square=True, linewidths=.5, cbar_kws={"shrink": .5})    
-    ax.set_xticklables(corr.index, fontsize=6)
+                square=True, linewidths=.5, cbar_kws={"shrink": .5}
+                ,xticklabels=True, yticklabels=True
+                )    
+    ax.set_xticklabels(corr.index, fontsize=6)
     ax.set_yticklabels(corr.index, fontsize=6)
+    plt.tight_layout()
     plt.savefig("./disorientation/figs/corr_matrix.png")
 
-def remove_correlates(X, coeff=.8):
+@main.command()
+@click.option("--coeff", "-c", default=.8)
+@click.option("--update/--no-update", default=True)
+def get_correlated_features(coeff, update):
     """Identify which features have highest correlation coefficient. The method
     returns a list of column names that should be excluded from an analysis,
     but also updates a table in the project database
 
     Args:
-        X (pandas dataframe): Pandas dataframe containing only predictor variables
         coeff (float): threshold to identify values that should be removed
 
     """
-
-    corr = X.corr()
+    corr = df[x_vars].corr()
     #correlates = set()
     correlates = list()
     for col_idx in range(len(corr.columns)):
@@ -172,20 +181,25 @@ def remove_correlates(X, coeff=.8):
                      "corr_coeff": corr_coeff}
                 correlates.append(d)
     df_corr = pd.read_json(json.dumps(correlates), orient="records")
-    df_corr.to_sql("correlation_values", con=engine, if_exists="replace", 
-        index=False)
+    if update:
+        df_corr.to_sql("correlation_values", con=engine, if_exists="replace", 
+            index=False)
     return df_corr.variable.to_list()
 
-def correlated_feature_list(df):
+def correlated_feature_list(coeff=.8):
     try:
         df_corr = pd.read_sql("select * from correlation_values", engine)
         return df_corr.variable.to_list()
     except:
-        corr_feats = remove_correlates(df)
+        corr_feats = get_correlated_features(coeff, False)
         return corr_feats
 
-
-def create_feature_scores(df, yname="net", n_features=1, create_plot=False):
+@main.command()
+@click.option("--yname", default="net")
+@click.option("--n_features", "-nf", default=1)
+@click.option("--plot/--no-plot", default=False)
+@click.option("--coeff", "-c", default=.8)
+def create_feature_scores(yname, n_features, plot, coeff):
     """Select most important features using recursive feature elimination (RFE)
         in conjunction with random forest regression and then plot the accuracy
         of the fit.
@@ -210,7 +224,7 @@ def create_feature_scores(df, yname="net", n_features=1, create_plot=False):
     from sklearn.ensemble import RandomForestRegressor 
     from sklearn.feature_selection import RFE
 
-    corr_features = correlated_feature_list(df)
+    corr_features = correlated_feature_list(coeff)
     X = df[[col for col in x_vars if col not in corr_features]]
     cols = X.columns
     feature_rank = {}
@@ -278,7 +292,7 @@ def create_feature_scores(df, yname="net", n_features=1, create_plot=False):
     sort_feat_rank = df_feature_rank.sort_values("mean", ascending=False)
     sort_feat_rank["colnames"] = sort_feat_rank.index
     #plot feature rankings
-    if create_plot:
+    if plot:
         f = sns.catplot(x="mean", y="colnames", data=sort_feat_rank, kind="bar",
                         palette="coolwarm", height=22)
         f.set_yticklabels(sort_feat_rank.colnames,fontsize=10)
@@ -288,6 +302,20 @@ def create_feature_scores(df, yname="net", n_features=1, create_plot=False):
         f.fig.suptitle("Mean Feature Importance for {}".format(yname))
         plt.savefig("./disorientation/figs/bar_feat_ranking_{}.png".format(yname))
     return accuracy
+
+@main.command()
+@click.option("--coeff", "-c", default=.8)
+@click.option("--plot/--no-plot", default=True)
+@click.option("--yname", default="net")
+@click.option("--n-features", "-nf", default=1)
+@click.option("--feature-score", "-fc", default=0.)
+def update_all(coeff, yname, n_features, feature_score, plot):
+    """Update `correlation_values` and `feature_rank` tables and generate new
+    plots for rfr_accuracy, bar_feat_ranking 
+    """
+    get_correlated_features(coeff, plot)
+    create_feature_scores(yname, n_features, True, coeff)  
+    plot_estimates(plot, feature_score, yname)
 
 def select_features(yname="net", index_only=False, min_score=.0):
     """Select the feature rank table (feature_rank_<yname>) from postgres
@@ -310,14 +338,19 @@ def select_features(yname="net", index_only=False, min_score=.0):
     df = pd.read_sql(sql.format(**params), engine)
     return df
 
-
-def scatter_plot(df, y="net"):
+@main.command()
+@click.option("-y", default="net")
+@click.option("--all", "-a", is_flag=True)
+def scatter_plot(y, all):
     """Generates scatter plot matrix for all predictor variables against a y-value
     such as net construction, total construction or toal demolition.
     """
-    corr_cols = correlated_feature_list(df)
-    cols = sorted([col for col in x_vars if col not in corr_cols])
-    nrows, ncols = 10,10
+    if all:
+        corr_cols = correlated_feature_list()
+        cols = sorted([col for col in x_vars if col not in corr_cols])
+    else:
+        cols = sorted([col for col in x_vars])
+    nrows, ncols = 10,12
     f, axes = plt.subplots(nrows, ncols, sharex=False, sharey=True,
                     tight_layout=True, figsize=(24,24))
     var_pos = 0
@@ -341,7 +374,15 @@ def scatter_plot(df, y="net"):
     plt.savefig("./disorientation/figs/scatter_plot_all_feats_{}.png".format(y))
     plt.close()
 
-def num_trees(df, create_plot=False,feat_score=.25, yname="net"):
+@main.command()
+@click.option("--plot/--no-plot", default=False)
+@click.option("--feat_score", "-fs", default=.25)
+@click.option("--yname", "-y", default="net")
+def plot_estimates(plot, feat_score, yname):
+    """Generate plots comparing different different numbers of estimators to
+    determine the number to use for final model
+
+    """
 
     features = select_features(index_only=True, min_score=feat_score, yname=yname)
     #determinte number of trees in forest
@@ -382,7 +423,7 @@ def num_trees(df, create_plot=False,feat_score=.25, yname="net"):
         plt.plot(xs, ys, label=label, color=color,
                 linestyle=linestyle)
 
-    if create_plot:
+    if plot:
         plt.xlim(min_estimators, max_estimators)
         plt.xlabel("n_estimators")
         plt.ylabel("OOB error rate")
@@ -393,19 +434,124 @@ def num_trees(df, create_plot=False,feat_score=.25, yname="net"):
         plt.title(title.format(feat_score, features.shape[0], yname), pad=10)
         plt.tight_layout()
         min_score_format = int(feat_score*100)
-        plt.savefig("./disorientation/figs/rfr_accuracy_{0}_{1}.png".format(yname,min_score_format))
+        plt.savefig("./disorientation/figs/rfr_accuracy_{0}_{1}_new.png".format(yname,min_score_format))
         plt.close()
 
+def add_features(data, id_name):
 
-@click.command()
-@click.option("--correlation", "-c", is_flag=True)
-def main(correlation):
-    X = df[x_vars]
-    #scaling function
-    #Net Construction PD
-    y = df.net
-    if correlation:
-        corr_matrix(df)
+    #helper method to lookup correct postgres datatype
+    def dtype_lookup(column_name):
+        pd_type = data[column_name].dtype.name
+        dict_dtype = {"object":"text",
+                      "float64": "float",
+                      "int64": "integer"}
+        return dict_dtype[pd_type]
+    with engine.begin() as cnx:
+        for col in [c for c in data.columns if c != id_name]:
+            #add column to `all_features` if it doesn't already exist
+            data_type = dtype_lookup(col)
+            sql_create = ("alter table all_features " 
+                            "add column if not exists {0} {1}"
+                            )
+            cnx.execute(sql_create.format(col, data_type))
+            #update current column in all_features with new values
+            update_vals = {"column": col, "id_name": id_name}
+            val_id = list(zip(data[col], data[id_name]))
+            update_vals["values"] = ",".join("({0}, '{1}')".format(*i) 
+                                        for i in val_id)
+            sql = ("update all_features a set {column} =  n.{column} "
+                    "from (values {values}) as n ({column}, {id_name}) "
+                    "where n.{id_name} = a.{id_name}"
+                    )
+            cnx.execute(sql.format(**update_vals))
 
+def more_parcels():
+
+    sql = ("with par as ( "
+            "select wkb_geometry, parcelid, st_area(p.wkb_geometry)/43560 par_acre, "  
+                "sfcom, sfla, rmtot, res_par_perim, livunit "  
+            "from built_env.sca_shelby_parcels_2017 p "
+            "full join (select parid, sum(sf) sfcom from "  
+                "built_env.sca_comintext group by parid) c "
+                "on c.parid = parcelid "  
+            "full join (select parid, sum(sfla) sfla, sum(rmtot) rmtot "  
+                "from built_env.sca_dweldat group by parid) d "
+                "on d.parid = parcelid "
+            "full join "
+            "(select parid, livunit, "
+                "case when luc = '062' then st_perimeter(wkb_geometry) "
+                    "else 0 end res_par_perim "
+                "from built_env.sca_pardat, built_env.sca_shelby_parcels_2017 "
+                "where parcelid = parid) pa "
+            "on pa.parid = parcelid) "
+            "select geoid10, par_acre, sfcom, sfla, rmtot, res_par_perim, livunit "
+            "from par, tiger_tract_2010 t "
+            "where st_intersects(st_centroid(par.wkb_geometry), t.wkb_geometry) "
+        )
+    df = pd.read_sql(sql, engine)
+    df.fillna(0, inlace=True)
+    grp = df.groupby("geoid10").median()
+    grp.reset_index(inplace=True)
+    add_features(grp, "geoid10")
+
+def simpson_diversity():
+    """Calculates a diversity index using Simpson's diversity index as represented
+    by the formula:
+
+        D = 1 - (sum(n(n-1))/N(N-1))
+    where n is a total for a particular land use and N is the total land uses for
+    a given geography.
+    """
+    sql = ("select luc, count(luc) ct_luc, geoid10 from built_env.sca_pardat, "
+            "built_env.sca_shelby_parcels_2017 p, tiger_tract_2010 t "
+            "where parid = parcelid and st_intersects(st_centroid(p.wkb_geometry), "
+            "t.wkb_geometry) "
+            "group by luc, geoid10"
+            )
+
+    df = pd.read_sql(sql, engine)
+    #calculate n
+    sp_count = lambda n: n * (n -1)
+    df["ind_count"] = df.ct_luc.apply(sp_count)
+    #calculate the diversity score, D, for all geographies
+    def diversity_index(ind_count, all_count):
+        return 1 - (sum(ind_count) / (sum(all_count)*(sum(all_count)-1)))
+    div_score = pd.DataFrame(df.groupby("geoid10").apply(
+                    lambda x: diversity_index(x["ind_count"], x["ct_luc"])))
+    div_score.reset_index(inplace=True)
+    div_score.rename(columns={0:"div_idx"}, inplace=True)
+    add_features(div_score, "geoid10")
+
+def parse_raster():
+    """Steps taken to create data:
+        1. Raster representation of land uses was created using gdal_rasterize in 
+            QGIS using a cell size of 30 map units (feet). 
+        2. Tract table was split into individual shapefiles based on geoid using
+            Split vector layer tool in QGIS
+        3. Split census tract shapefiles were used to split Raster created in 
+            step 1 into individual rasters using gdal_wrap tool within shell 
+            script
+    TODO: 
+        - automate rasterization using gdal_rasterize with postgresql layer
+    
+    """
+    import pylandstats as pls
+    
+    raster_dir = "/home/natron/temp/split_raster"
+
+    land_metrics = ["number_of_patches", "patch_density", "largest_patch_index",
+                    "total_edge", "edge_density", "landscape_shape_index",
+                    "contagion", "shannon_diversity_index"]
+    all_geoids = []
+    for img in os.listdir(raster_dir):
+        geoid = img[8:-4]
+        land = pls.Landscape(os.path.join(raster_dir, img))
+        land_stats = land.compute_landscape_metrics_df()
+        ls_dict = land_stats[land_metrics].to_dict("records")[0]
+        ls_dict["geoid10"] = geoid
+        all_geoids.append(ls_dict)
+    df = pd.DataFrame(all_geoids)
+    add_features(df, "geoid10")
+    
 if __name__=="__main__":
     main()
