@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.decomposition import PCA
 from configparser import ConfigParser
 from sqlalchemy import create_engine
 import os
@@ -34,7 +35,7 @@ df['scale_demo'] = min_max_scale(df.numdemo)
 #to run correctly in fact_heatmap function
 df['net'] = df.scale_const - df.scale_demo
 RANDOM_STATE = 1416
-yname = "scale_const"#"net"
+yname = "net"#"scale_const"#"net"
 y = df[yname]
 features = analysis.select_features(yname, True, .25)
 #X = df[features["index"]]
@@ -70,6 +71,7 @@ for i in range(min_estimators, max_estimators + 1):
     print()
 
 pca = PCA(n_components=1)
+X = df[x_vars]
 X_new = pca.fit_transform(X)
 y_pos_idx = y[y >= 0].index
 y_neg_idx = y[y < 0].index
