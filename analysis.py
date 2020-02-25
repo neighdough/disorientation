@@ -8,14 +8,13 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestRegressor 
 from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.manifold import TSNE
 from collections import OrderedDict
 from configparser import ConfigParser
 from sqlalchemy import create_engine
 import click
 import json
 import itertools
-import plotly as ply
-import plotly.express as px
 
 cnx_dir = os.getenv("CONNECTION_INFO")
 parser = ConfigParser()
@@ -26,6 +25,8 @@ engine = create_engine(psql_string.format(**psql_params))
 pd.set_option('display.width', 180)
 pd.set_option('display.float_format', lambda x: '%.3f' % x)
 pd.set_option('display.max_rows', 125)
+home = os.getenv("HOME")
+out_dir = os.path.join(home,"Dropbox/phd/dissertation/")
 
 
 df = pd.read_sql("select * from all_features", engine)
@@ -42,9 +43,9 @@ df['scale_demo'] = min_max_scale(df.numdemo)
 df['net'] = df.scale_const - df.scale_demo
 RANDOM_STATE = 1416
 
-fig = px.parallel_coordinates(df[x_vars+["net"]], color="net", labels=x_vars+["net"], 
-color_continuous_scale=px.colors.diverging.Tealrose, color_continuous_midpoint=0)
-ply.offline.plot(fig)
+#fig = px.parallel_coordinates(df[x_vars+["net"]], color="net", labels=x_vars+["net"], 
+#color_continuous_scale=px.colors.diverging.Tealrose, color_continuous_midpoint=0)
+#ply.offline.plot(fig)
 
 def add_missing(df):
     idx_cols = ["month", "year", "name"]
@@ -155,7 +156,7 @@ def corr_matrix():
     ax.set_xticklabels(corr.index, fontsize=6)
     ax.set_yticklabels(corr.index, fontsize=6)
     plt.tight_layout()
-    plt.savefig("./disorientation/figs/corr_matrix.png")
+    plt.savefig(out_dir+"/figs/corr_matrix.png")
 
 @main.command()
 @click.option("--coeff", "-c", default=.8)
@@ -300,7 +301,7 @@ def create_feature_scores(yname, n_features, plot, coeff):
         f.set_ylabels("Column Name")
         f.fig.tight_layout(pad=6.)
         f.fig.suptitle("Mean Feature Importance for {}".format(yname))
-        plt.savefig("./disorientation/figs/bar_feat_ranking_{}.png".format(yname))
+        plt.savefig(out_dir+"/figs/bar_feat_ranking_{}.png".format(yname))
     return accuracy
 
 @main.command()
@@ -344,34 +345,51 @@ def select_features(yname="net", index_only=False, min_score=.0):
 def scatter_plot(y, all):
     """Generates scatter plot matrix for all predictor variables against a y-value
     such as net construction, total construction or toal demolition.
+
+    Args:
+        y (str): column name to be used for dependent variable
+        all (bool): True if all features should be included, False if correlated
+            variables should be excluded
+    Returns:
+        None
     """
-    if all:
+    if not all:
         corr_cols = correlated_feature_list()
         cols = sorted([col for col in x_vars if col not in corr_cols])
     else:
         cols = sorted([col for col in x_vars])
-    nrows, ncols = 10,12
+    nrows, ncols = 9,14#14,9#10,12
+    widths = [1 for col in range(ncols)]
+    heights = [1 for row in range(nrows)]
+    gridspec_dict={"width_ratios":widths,
+                   "height_ratios": heights}
     f, axes = plt.subplots(nrows, ncols, sharex=False, sharey=True,
-                    tight_layout=True, figsize=(24,24))
+                    tight_layout=True, figsize=(34,22), 
+                    gridspec_kw=gridspec_dict
+                    )
     var_pos = 0
     def plot(var_pos, row, col):
         #if y-value is for net construction, add two plots, one for net-poitive
         #construction, the other for net negative
+        aspect = "auto"
         if y == "net":
             df[df.net < 0].plot.scatter(x=cols[var_pos], y=y, marker="<",
                 ax=axes[row,col],color="Purple")
+            axes[row,col].set_aspect(aspect)
             df[df.net >= 0].plot.scatter(x=cols[var_pos], y=y, marker=">",
                 ax=axes[row,col], color="Green")       
+            axes[row,col].set_aspect(aspect)
         else:
             color = lambda x: "Green" if "const" in x else "Purple"
             df.plot.scatter(x=cols[var_pos], y=y, marker=">",
                 ax=axes[row,col], color=color(y))
+            axes[row,col].set_aspect(aspect)
     for row in range(nrows):
         for col in range(ncols):
             if var_pos < len(cols):
                 plot(var_pos, row, col)
             var_pos += 1
-    plt.savefig("./disorientation/figs/scatter_plot_all_feats_{}.png".format(y))
+    plt.savefig(out_dir+"/figs/scatter_plot_all_feats_{}.png".format(y))
     plt.close()
 
 @main.command()
@@ -434,7 +452,7 @@ def plot_estimates(plot, feat_score, yname):
         plt.title(title.format(feat_score, features.shape[0], yname), pad=10)
         plt.tight_layout()
         min_score_format = int(feat_score*100)
-        plt.savefig("./disorientation/figs/rfr_accuracy_{0}_{1}_new.png".format(yname,min_score_format))
+        plt.savefig(out_dir+"/figs/rfr_accuracy_{0}_{1}_new.png".format(yname,min_score_format))
         plt.close()
 
 def add_features(data, id_name):
@@ -552,6 +570,22 @@ def parse_raster():
         all_geoids.append(ls_dict)
     df = pd.DataFrame(all_geoids)
     add_features(df, "geoid10")
-    
+
+def low_dimensional_plot():
+    y = df["net"]
+    x = df[x_vars]
+    perplex = 5
+    nrows, ncols = 5,5
+    idx = 1
+    for row in nrows:
+        for col in ncols:
+            x_fit = TSNE(n_components=2, perplexity=perplex).fit_transform(x)
+            plt.subplot(nrows,ncols, idx, sharex=True, sharey=True)
+            plt.scatter(x_fit[:,0], x[:,1], c=y, cmap=plt.get_cmap("PRGn"))
+            plt.title("Perplexity: {}".format(perplex))
+            perplex += 5
+            idx += 1
+            
+
 if __name__=="__main__":
     main()
