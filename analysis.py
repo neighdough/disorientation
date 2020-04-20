@@ -11,10 +11,11 @@ from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.manifold import TSNE
 from collections import OrderedDict
 from configparser import ConfigParser
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import click
 import json
 import itertools
+import re
 
 cnx_dir = os.getenv("CONNECTION_INFO")
 parser = ConfigParser()
@@ -27,7 +28,7 @@ pd.set_option('display.float_format', lambda x: '%.3f' % x)
 pd.set_option('display.max_rows', 125)
 home = os.getenv("HOME")
 out_dir = os.path.join(home,"Dropbox/phd/dissertation/")
-
+fig_home = os.path.join(home,out_dir, "figs")
 
 df = pd.read_sql("select * from all_features", engine)
 df.fillna(0, inplace=True)
@@ -294,14 +295,15 @@ def create_feature_scores(yname, n_features, plot, coeff):
     sort_feat_rank["colnames"] = sort_feat_rank.index
     #plot feature rankings
     if plot:
-        f = sns.catplot(x="mean", y="colnames", data=sort_feat_rank, kind="bar",
-                        palette="coolwarm", height=22)
-        f.set_yticklabels(sort_feat_rank.colnames,fontsize=10)
-        f.set_xlabels("Mean Feature Importance")
-        f.set_ylabels("Column Name")
-        f.fig.tight_layout(pad=6.)
-        f.fig.suptitle("Mean Feature Importance for {}".format(yname))
-        plt.savefig(out_dir+"/figs/bar_feat_ranking_{}.png".format(yname))
+        f, ax = plt.subplots(figsize=(34,22))
+        f = sns.barplot(x="mean", y="colnames", data=sort_feat_rank,
+                        palette="coolwarm")
+        f.set_yticklabels(sort_feat_rank.index, fontsize=10)
+        f.set_xlabel("Mean Feature Importance")
+        f.set_ylabel("Column Name")
+        f.figure.tight_layout(pad=6.)
+#        f.fig.suptitle("Mean Feature Importance for {}".format(yname))
+        plt.savefig(out_dir+"/figs/bar_feat_ranking_{}_horizontal.png".format(yname))
     return accuracy
 
 @main.command()
@@ -390,6 +392,17 @@ def scatter_plot(y, all):
                 plot(var_pos, row, col)
             var_pos += 1
     plt.savefig(out_dir+"/figs/scatter_plot_all_feats_{}.png".format(y))
+    plt.close()
+
+def scatter_plot_single(y, x_label, filter_val=None):
+    if filter_val:
+        new_df = df[df[x_label] <= filter_val]
+    else:
+        new_df = df.copy()
+    colors = lambda x: "Purple" if x < 0 or "demo" in y.lower() else "Green"
+    new_df["color"] = new_df[y].apply(colors)
+    new_df.plot.scatter(x=x_label, y=y, color=new_df.color, s=8)
+    plt.savefig(fig_home + "/scatter_plot_{0}_{1}.png".format(y,x_label))
     plt.close()
 
 @main.command()
@@ -585,7 +598,60 @@ def low_dimensional_plot():
             plt.title("Perplexity: {}".format(perplex))
             perplex += 5
             idx += 1
-            
+
+def compare_city_owned():
+    """
+    By permit name:
+    0.03% city-led construction
+    96.5% city-led demolition
+    By city-owned property
+    0.6 % difference in construction
+    0.2% difference in demolition 
+    """
+    q = ("select * "
+          "from (select geoid10, "
+          "count(distinct case when const_type = 'new' then permit end) numpermit,"
+	      "count(distinct case when const_type = 'demo' then permit end) numdemo "
+          "from permits p, tiger_tract_2010 t "
+          "where st_within(p.wkb_geometry, t.wkb_geometry) {}"
+          "group by t.geoid10) q "
+        "order by geoid10"
+    )
+
+    omit = " and lower(p.name) not similar to '%(city of|cizty of)%' "
+    df_all = pd.read_sql(text(q.format("")), engine)
+    df_limit = pd.read_sql(text(q.format(omit)), engine)
+    q_zoning = ("with p as (select wkb_geometry, "
+		        "lower(regexp_replace(zoning, '[^a-zA-Z0-9]', '', 'g')) zoning "
+		        "from built_env.sca_shelby_parcels_2017, built_env.sca_pardat "
+		        "where parcelid = parid) "
+                "select geoid10, zoning, "
+                "count(zoning) from tiger_tract_2010 t, p "
+                "where st_intersects(st_centroid(p.wkb_geometry), t.wkb_geometry) "
+                "group by geoid10, zoning"                
+                )
+    dfz = pd.read_sql(text(q_zoning), engine)
+    dfz_pivot = dfz.pivot(index="geoid10", columns="zoning", values="count")
+    dfz_pivot.fillna(0., inplace=True)
+    dfz_pivot.reindex(inplace=True)
+    df = df.join(dfz_pivot, on="geoid10", how="left")
+    q_cityown = ("with parcels as (select wkb_geometry "
+	                "from sca_owndat, built_env.sca_shelby_parcels_2017 pa "
+                    "where lower(concat(adrno,adrdir,adrstr,adrsuf)) <> '125nmainst' "
+                    "and parcelid=parid) "
+                  "select geoid10, "
+                    "count(distinct case when const_type = 'new' then permit end) numpermit, "
+                    "count(distinct case when const_type = 'demo' then permit end) numdemo "
+                  "from permits p, tiger_tract_2010 t, parcels "
+                    "where st_intersects(p.wkb_geometry, parcels.wkb_geometry) "
+                    "and st_intersects(p.wkb_geometry, t.wkb_geometry) "
+                    "group by geoid10"
+                )
+    df_cityown = pd.read_sql(q_cityown, engine)
+#    chars = "[/\/#/$/*///-/(/)/s]"
+#    dfz.zoning = dfz.zoning.str.replace(chars, "").str.lower()    
+
+                
 
 if __name__=="__main__":
     main()
